@@ -134,6 +134,7 @@ async def main() -> None:
     # Register the workflow and activity with Dapr's workflow runtime
     runtime = wf.WorkflowRuntime()
     runtime.register_workflow(handle_sla_breach_workflow)
+    runtime.register_workflow(handle_sla_breach)
     runtime.register_activity(draft_response_activity)
     runtime.start()
 
