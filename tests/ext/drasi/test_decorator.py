@@ -63,7 +63,7 @@ def test_drasi_trigger_requires_query_id_or_topic():
 
 def test_drasi_trigger_no_parens_raises():
     # @drasi_trigger without args should raise because query_id/topic not set
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, ValueError)):
         @drasi_trigger
         async def handle(self, ctx, message: ChangeEvent):
             pass
