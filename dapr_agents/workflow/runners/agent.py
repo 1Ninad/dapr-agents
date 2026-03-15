@@ -280,22 +280,35 @@ class AgentRunner(WorkflowRunner):
         specs: list[PubSubRouteSpec] = []
         for _, handler in handlers.items():
             meta = getattr(handler, "_message_router_data", {})
+            is_drasi = getattr(handler, "_is_drasi_trigger", False)
             is_broadcast = meta.get("is_broadcast", False)
-            topic: Optional[str] = (
-                config.broadcast_topic if is_broadcast else config.agent_topic
-            )
-            if not topic:
-                kind = "broadcast" if is_broadcast else "direct"
-                raise ValueError(
-                    f"AgentPubSubConfig missing topic for {kind} handler {handler.__name__}"
-                )
+
+            if is_drasi:
+                # @drasi_trigger handlers specify their own pubsub and topic.
+                # Do not override with config.agent_topic — that would route
+                # the Drasi event to the wrong topic.
+                topic = meta.get("topic")
+                pubsub_name = meta.get("pubsub") or config.pubsub_name
+                if not topic:
+                    raise ValueError(
+                        f"@drasi_trigger on '{handler.__name__}' is missing a topic. "
+                        "Provide 'query_id' or 'topic' in the decorator."
+                    )
+            else:
+                topic = config.broadcast_topic if is_broadcast else config.agent_topic
+                pubsub_name = config.pubsub_name
+                if not topic:
+                    kind = "broadcast" if is_broadcast else "direct"
+                    raise ValueError(
+                        f"AgentPubSubConfig missing topic for {kind} handler {handler.__name__}"
+                    )
 
             schemas = meta.get("message_schemas") or []
             message_model = schemas[0] if schemas else None
 
             specs.append(
                 PubSubRouteSpec(
-                    pubsub_name=config.pubsub_name,
+                    pubsub_name=pubsub_name,
                     topic=topic,
                     handler_fn=handler,
                     message_model=message_model,
