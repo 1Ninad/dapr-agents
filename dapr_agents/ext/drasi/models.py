@@ -20,10 +20,11 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ResultEvent(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     """Base class for all events that come from Drasi queries."""
     kind: str
     queryId: str = Field(description="The Drasi query that produced this event")
@@ -81,7 +82,7 @@ class ControlSignalKind(str, Enum):
 
 
 class ControlSignal(BaseModel):
-    """A lifecycle signal from the Drasi query engine."""
+    model_config = ConfigDict(extra="ignore")
     kind: str  # One of ControlSignalKind values
 
 
@@ -108,6 +109,7 @@ class ChangeOp(str, Enum):
 
 
 class ChangePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     """The data for one individual record change."""
     source: Optional[Dict[str, Any]] = Field(
         default=None,
@@ -124,6 +126,7 @@ class ChangePayload(BaseModel):
 
 
 class DrasiChangeNotification(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     """
     An unpacked change notification - one message per changed database record.
 
