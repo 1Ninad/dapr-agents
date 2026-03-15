@@ -1,420 +1,217 @@
-# Plan: Reactive Ambient Agents — Drasi + Dapr Integration
-## GSoC 2026 | Build-from-scratch reference
+# Plan: Drasi + Dapr Agents Integration Layer
 
-> **How to use this doc**: Read top to bottom. Each section tells you exactly what to build,
-> in what order, and what will go wrong (so you don't repeat the same bugs).
-> You can rebuild this entire project from scratch using only this file.
+## Context
 
----
+Current AI agents wait for user input. "Ambient Agents" should wake up autonomously when real-world data conditions change. Drasi detects database changes via continuous queries and publishes them to Dapr Pub/Sub. Dapr Agents provides a durable, workflow-based agent runtime. This plan connects them: Drasi change events flow into Dapr Agents, so agents wake up only when specific data conditions are met (scale-to-zero).
 
-## Why This Exists
-
-Current AI agents are passive — they wait for a user to type something. The goal is to build
-**Ambient Agents** that wake up *only* when a real database condition is met (e.g. a support
-ticket is 26 hours overdue), do work (call an LLM, send a notification), and go back to sleep.
-
-**No polling. No persistent socket. Pure event-driven. Scale-to-zero.**
-
-The two systems being connected:
-- **Drasi** — a CNCF project that runs continuous SQL queries against live databases and
-  publishes change events when query results change (rows added/updated/deleted)
-- **Dapr Agents** — a Python framework for building durable AI agent workflows on top of Dapr
-
-Neither system knows about the other. This project is the bridge.
-
----
-
-## Data Flow (memorise this — everything else follows from it)
-
+**Data flow:**
 ```
-Real Database (Postgres / CosmosDB / etc.)
-        │
-        │  a row changes (insert / update / delete)
-        ▼
-Drasi Continuous Query Engine
-        │
-        │  evaluates continuous SQL query (e.g. "tickets WHERE sla_hours > 24")
-        │  publishes ChangeEvent JSON to Dapr pub/sub:
-        │    component: drasi-pubsub
-        │    topic:     {queryId}-results   (e.g. "sla-breaches-results")
-        ▼
-[Deliverable 1] Router Reaction  (our Python microservice)
-        │
-        │  reads per-query YAML config: which agent topic to forward to, which format
-        │  transforms ChangeEvent → CloudEvent
-        │  publishes to Dapr pub/sub:
-        │    component: agent-pubsub
-        │    topic:     {configured}  (e.g. "support.sla-breach")
-        ▼
-[Deliverable 2] Dapr Agent  (uses our @drasi_trigger decorator)
-        │
-        │  wakes up, Dapr Workflow starts
-        │  calls LLM, produces output
-        │  workflow completes
-        ▼
-Agent goes back to sleep (scale to zero)
+Database --> Drasi CQ Engine --> [drasi-pubsub: {queryId}-results] --> Router Reaction --> [agent-pubsub: configurable-topic] --> Dapr Agent
 ```
 
----
-
-## Repositories and Branch
-
-| Repo | What lives here | Branch |
-|------|----------------|--------|
-| `github.com/1Ninad/drasi-platform` | Router Reaction microservice | `gsoc-v1` |
-| `github.com/1Ninad/dapr-agents` | SDK extension + demo agent | `gsoc-v1` |
-
-**Always work on `gsoc-v1` — never commit to `main`.**
+Three deliverables (build order):
+1. **Router Reaction** (standalone Python microservice in **drasi-platform** repo) - bridges Drasi events to agent pub/sub topics + hosts MCP server. **Build first** - produces the CloudEvent contract.
+2. **SDK Extension** (`dapr_agents.ext.drasi` in **dapr-agents** repo) - Pydantic models + `@drasi_trigger` decorator. **Build second** - consumes the contract defined by the router.
+3. **Demo** - end-to-end "Proactive Support Agent" in **dapr-agents** repo. **Build last** - wires everything together.
 
 ---
 
-## Build Order (strict — do not swap)
+## Deliverable 1: Router Reaction (BUILD FIRST)
 
-1. **Router Reaction** first — it defines the CloudEvent JSON contract
-2. **SDK Extension** second — it consumes that contract
-3. **Demo Agent** last — it wires everything together
+> Lives in **drasi-platform** repo at `reactions/dapr-agents-router/`. Defines the CloudEvent contract that agents will consume.
 
----
+### Files to create
 
-## Deliverable 1: Router Reaction
-
-**Repo:** `drasi-platform`
-**Location:** `reactions/dapr-agents-router/`
-
-### What it is
-A standalone Python microservice (runs as a Docker container in Kubernetes).
-It sits between Drasi and your agents.
-- Subscribes to Drasi's output topics (`{queryId}-results` on `drasi-pubsub`)
-- Reads a YAML config file per query (from `/etc/queries/{queryId}`) that says which
-  agent topic to forward to and in which format
-- Transforms the event and publishes it to the agent's topic
-- Also runs an MCP server on port 3001 so agents can discover available queries
-
-### File structure to create
 ```
 reactions/dapr-agents-router/
     pyproject.toml
     Dockerfile
+    README.md
     src/
         __init__.py
-        config.py        # RouterQueryConfig Pydantic model
-        formatter.py     # format_packed() and format_unpacked()
-        router.py        # DrasiAgentRouter class
-        mcp_server.py    # MCP server on port 3001
-        main.py          # entrypoint
+        main.py           # Entrypoint: starts reaction + MCP server
+        config.py         # RouterQueryConfig model
+        router.py         # DrasiAgentRouter (composes DrasiReaction)
+        formatter.py      # Packed/Unpacked CloudEvent formatters
+        mcp_server.py     # MCP server for query discovery
     tests/
-        test_formatter.py
         test_router.py
+        test_formatter.py
 ```
 
----
-
-### Step 1.1 — `src/config.py`
+### Step 1: Per-query config (`src/config.py`)
 
 ```python
-import os
-from enum import Enum
-from typing import Any
-import yaml
-from pydantic import BaseModel, Field
-
 class OutputFormat(str, Enum):
     PACKED = "packed"
     UNPACKED = "unpacked"
 
 class RouterQueryConfig(BaseModel):
-    # Field aliases: YAML uses camelCase, Python uses snake_case
-    pubsub_name: str = Field(
-        default_factory=lambda: os.getenv("DefaultPubsubName", "agent-pubsub"),
-        alias="pubsubName"
-    )
+    # Use Field aliases: YAML files use camelCase (pubsubName, topicName)
+    pubsub_name: str = Field(default="agent-pubsub", alias="pubsubName")
     topic_name: str = Field(alias="topicName")
     format: OutputFormat = OutputFormat.PACKED
     skip_control_signals: bool = Field(default=True, alias="skipControlSignals")
     model_config = {"populate_by_name": True}
 
 def parse_query_config(f) -> dict:
-    """Called by DrasiReaction for each file in /etc/queries/"""
+    """Passed to DrasiReaction; parses /etc/queries/{queryId} YAML files."""
     return yaml.safe_load(f)
 ```
 
-**Why aliases**: YAML config files use `pubsubName`, `topicName` (camelCase).
-Pydantic needs aliases to parse them correctly.
+Loaded from `/etc/queries/{queryId}` YAML files (same pattern as all Drasi reactions).
 
----
+### Step 2: Formatter (`src/formatter.py`)
 
-### Step 1.2 — `src/formatter.py`
+Two modes matching the C# `ChangeHandler.cs` at `reactions/dapr/post-pubsub/.../Services/ChangeHandler.cs`:
 
-Two output formats:
-
-**Packed**: entire ChangeEvent as one message. One call to the agent per query update.
-CloudEvent type = `drasi.change.packed`
-
-**Unpacked**: one message per changed row. Multiple calls to agent per query update.
-CloudEvent types = `drasi.change.insert` / `drasi.change.update` / `drasi.change.delete`
+- **Packed:** Serialize entire `ChangeEvent` as one CloudEvent. Type = `drasi.change.packed`.
+- **Unpacked:** Extract each individual add/update/delete. One CloudEvent per record. Types = `drasi.change.insert`, `drasi.change.update`, `drasi.change.delete`.
 
 ```python
-from drasi.reaction.models.ChangeEvent import ChangeEvent
-from .config import OutputFormat, RouterQueryConfig
-
 def format_packed(event: ChangeEvent, config: RouterQueryConfig) -> list[dict]:
     return [event.model_dump()]
 
 def format_unpacked(event: ChangeEvent, config: RouterQueryConfig) -> list[dict]:
     messages = []
     for record in event.addedResults:
-        messages.append({
-            "op": "I", "queryId": event.queryId,
-            "sequence": event.sequence, "tsMs": event.sourceTimeMs,
-            "payload": {"before": None, "after": record.root}
-        })
+        messages.append({"op": "I", "queryId": event.queryId, ...})
     for update in event.updatedResults:
-        messages.append({
-            "op": "U", "queryId": event.queryId,
-            "sequence": event.sequence, "tsMs": event.sourceTimeMs,
-            "payload": {
-                "before": update.before.root if update.before else None,
-                "after": update.after.root if update.after else None,
-            }
-        })
+        messages.append({"op": "U", "queryId": event.queryId, ...})
     for record in event.deletedResults:
-        messages.append({
-            "op": "D", "queryId": event.queryId,
-            "sequence": event.sequence, "tsMs": event.sourceTimeMs,
-            "payload": {"before": record.root, "after": None}
-        })
+        messages.append({"op": "D", "queryId": event.queryId, ...})
     return messages
 
 def get_cloudevent_type(config: RouterQueryConfig, op: str | None) -> str:
-    if config.format == OutputFormat.PACKED:
-        return "drasi.change.packed"
-    op_map = {"I": "drasi.change.insert", "U": "drasi.change.update", "D": "drasi.change.delete"}
-    return op_map.get(op, "drasi.change.unknown")
+    # Returns drasi.change.packed / drasi.change.insert / drasi.change.update / drasi.change.delete
+    ...
 ```
 
----
+### Step 3: Router (`src/router.py`)
 
-### Step 1.3 — `src/router.py`
+Composes the existing `DrasiReaction` from the Drasi Python SDK.
 
-**CRITICAL WARNING**: `DaprClient` is **synchronous**. Do NOT use `async with DaprClient()`.
-It does not have `__aenter__`. Use plain `with DaprClient()` and plain `client.publish_event()`.
-(This was a bug in the original plan — fixed during implementation.)
+> **Note:** `DaprClient` is **synchronous**. Use `with DaprClient()` and `client.publish_event()` — not `async with` or `await`.
 
 ```python
-import json
-import logging
-from typing import Any
-
-from dapr.clients import DaprClient
-from drasi.reaction.models.ChangeEvent import ChangeEvent
-from drasi.reaction.models.ControlEvent import ControlEvent
-from drasi.reaction.sdk import DrasiReaction
-
-from .config import OutputFormat, RouterQueryConfig, parse_query_config
-from .formatter import format_packed, format_unpacked, get_cloudevent_type
-
-logger = logging.getLogger(__name__)
-
 class DrasiAgentRouter:
-    def __init__(self, port: int = 80):
-        self._port = port
+    def __init__(self, port=80):
         self._reaction = DrasiReaction(
             on_change_event=self._handle_change,
             on_control_event=self._handle_control,
             parse_query_configs=parse_query_config,
             port=port,
         )
-        self._query_configs: dict[str, RouterQueryConfig] = {}
 
-    def start(self):
-        logger.info("Starting Drasi Agent Router")
-        self._reaction.start()  # blocks
-
-    async def _handle_change(self, event: ChangeEvent, raw_config: Any) -> None:
-        if raw_config is None:
-            logger.warning("No config for query '%s' — skipping", event.queryId)
-            return
+    async def _handle_change(self, event: ChangeEvent, raw_config):
         config = RouterQueryConfig.model_validate(raw_config)
-        self._query_configs[event.queryId] = config
-
-        messages = (
-            format_packed(event, config)
-            if config.format == OutputFormat.PACKED
-            else format_unpacked(event, config)
-        )
+        messages = format_packed(...) if config.format == PACKED else format_unpacked(...)
         await self._publish_messages(event, config, messages)
 
-    async def _handle_control(self, event: ControlEvent, raw_config: Any) -> None:
-        if raw_config is None:
-            return
-        config = RouterQueryConfig.model_validate(raw_config)
-        if config.skip_control_signals:
-            return
-        signal_kind = getattr(event.controlSignal, "kind", "unknown")
-        payload = {
-            "kind": "control", "queryId": event.queryId,
-            "sequence": event.sequence, "sourceTimeMs": event.sourceTimeMs,
-            "controlSignal": {"kind": signal_kind},
-        }
-        # SYNC — not async
-        with DaprClient() as client:
-            client.publish_event(
-                pubsub_name=config.pubsub_name,
-                topic_name=config.topic_name,
-                data=json.dumps(payload),
-                data_content_type="application/json",
-                publish_metadata={
-                    "cloudevent.source": f"drasi/query/{event.queryId}",
-                    "cloudevent.type": f"drasi.control.{signal_kind}",
-                },
-            )
-
     async def _publish_messages(self, event, config, messages):
-        if not messages:
-            return
-        # SYNC — not async
-        with DaprClient() as client:
+        with DaprClient() as client:                   # synchronous context manager
             for msg in messages:
-                op = msg.get("op")
-                ce_type = get_cloudevent_type(config, op)
-                client.publish_event(
+                client.publish_event(                  # synchronous call
                     pubsub_name=config.pubsub_name,
                     topic_name=config.topic_name,
                     data=json.dumps(msg),
                     data_content_type="application/json",
                     publish_metadata={
                         "cloudevent.source": f"drasi/query/{event.queryId}",
-                        "cloudevent.type": ce_type,
+                        "cloudevent.type": get_cloudevent_type(config, msg.get("op")),
                     },
                 )
+
+    def start(self):
+        self._reaction.start()
 ```
 
----
+### Step 4: MCP Server (`src/mcp_server.py`)
 
-### Step 1.4 — `src/mcp_server.py`
+Runs in a background thread on port 3001. Exposes Drasi queries as MCP **resources** (not tools — queries are data, not actions).
 
-MCP server using StreamableHTTP transport on port 3001.
-Exposes Drasi queries as MCP resources so agents can discover them.
+- `list_resources()` returns `drasi://query/{queryId}` for each configured query
+- `read_resource(uri)` returns the query's config (topic, format, description)
+
+Agents connect via `MCPClient` (already in dapr-agents SDK at `dapr_agents/tool/mcp/client.py`) to discover available queries at runtime.
 
 ```python
-from mcp.server.fastmcp import FastMCP
-from mcp import types
-
 mcp = FastMCP("drasi-router")
-_query_configs: dict = {}  # populated by router
 
 @mcp.list_resources()
 async def list_resources() -> list[types.Resource]:
-    return [
-        types.Resource(
-            uri=f"drasi://query/{qid}",
-            name=f"Drasi Query: {qid}",
-            description=f"Topic: {cfg.topic_name}, Format: {cfg.format.value}",
-            mimeType="application/json",
-        )
-        for qid, cfg in _query_configs.items()
-    ]
+    # return drasi://query/{queryId} URI for each query in _query_configs
+    ...
 
 @mcp.read_resource()
 async def read_resource(uri: str) -> str:
-    query_id = uri.replace("drasi://query/", "")
-    cfg = _query_configs.get(query_id)
-    if not cfg:
-        raise ValueError(f"Unknown query: {query_id}")
-    import json
-    return json.dumps({"queryId": query_id, "topic": cfg.topic_name, "format": cfg.format.value})
+    # return JSON config for the requested queryId
+    ...
 ```
 
----
-
-### Step 1.5 — `src/main.py`
+### Step 5: Entrypoint (`src/main.py`)
 
 ```python
-import threading
-from .router import DrasiAgentRouter
-from .mcp_server import mcp
-
 def main():
     router = DrasiAgentRouter()
-    # MCP server in background thread on port 3001
-    t = threading.Thread(target=lambda: mcp.run(transport="streamable-http", port=3001), daemon=True)
-    t.start()
+    # Run MCP server in background thread on port 3001
+    threading.Thread(
+        target=lambda: mcp.run(transport="streamable-http", port=3001),
+        daemon=True
+    ).start()
     router.start()  # blocks
-
-if __name__ == "__main__":
-    main()
 ```
 
----
-
-### Step 1.6 — Per-query YAML config (deployed to `/etc/queries/{queryId}`)
+### Step 6: Reaction config (`reaction.yaml`)
 
 ```yaml
-# /etc/queries/sla-breaches
-pubsubName: agent-pubsub
-topicName: support.sla-breach
-format: packed
-skipControlSignals: true
+kind: Reaction
+apiVersion: v1
+name: my-agent-router
+spec:
+  kind: DaprAgentsRouter
+  properties:
+    defaultPubsubName: agent-pubsub
+    defaultFormat: packed
+    mcpPort: "3001"
+  queries:
+    sla-breaches: |
+      pubsubName: agent-pubsub
+      topicName: support.sla-breach
+      format: packed
 ```
 
 ---
 
-### Step 1.7 — Tests
+## Deliverable 2: SDK Extension (BUILD SECOND)
 
-Install for tests: `pip install -e ../../sdk/python pytest pytest-asyncio`
+> Lives in the **dapr-agents** repo. No new external dependencies needed. Consumes the CloudEvent contract defined by the Router.
 
-**`tests/test_formatter.py`** — test packed/unpacked output with a sample ChangeEvent dict.
-No Dapr needed. Just call `format_packed(event, config)` and assert the output.
+### Files to create
 
-**`tests/test_router.py`** — mock `DaprClient` as a `MagicMock` (NOT AsyncMock — it's sync):
-```python
-mock_client = MagicMock()
-mock_client.__enter__ = MagicMock(return_value=mock_client)
-mock_client.__exit__ = MagicMock(return_value=None)
-with patch("src.router.DaprClient", return_value=mock_client):
-    await router._handle_change(event, config_dict)
-mock_client.publish_event.assert_called_once()
-```
+| File | Purpose |
+|------|---------|
+| `dapr_agents/ext/__init__.py` | Empty. Establishes `ext` namespace for future extensions. |
+| `dapr_agents/ext/drasi/__init__.py` | Public API: exports models, decorator, config. |
+| `dapr_agents/ext/drasi/models.py` | Pydantic v2 models for Drasi events (vendored, not imported from drasi-reaction-sdk). |
+| `dapr_agents/ext/drasi/decorator.py` | `@drasi_trigger` decorator. |
+| `dapr_agents/ext/drasi/config.py` | `DrasiSubscriptionConfig` dataclass. |
+| `tests/ext/__init__.py` | Empty. |
+| `tests/ext/drasi/__init__.py` | Empty. |
+| `tests/ext/drasi/test_models.py` | Tests for model validation. |
+| `tests/ext/drasi/test_decorator.py` | Tests for decorator behavior. |
 
----
+### Step 1: Pydantic models (`dapr_agents/ext/drasi/models.py`)
 
-## Deliverable 2: SDK Extension
+Vendor the Drasi event models (~60 lines). Do NOT add `drasi-reaction-sdk` as a dependency — it's alpha and not on PyPI.
 
-**Repo:** `dapr-agents`
-**Location:** `dapr_agents/ext/drasi/`
+> Add `model_config = ConfigDict(extra="ignore")` to every model so unknown fields from real Drasi payloads don't cause `ValidationError`.
 
-### What it is
-A Python module that makes subscribing to Drasi events one line of code in any Dapr Agent.
-No new package dependency — vendor the models, compose the existing `@message_router` decorator.
+Source reference: `drasi-platform/reactions/sdk/python/drasi/reaction/models/ChangeEvent.py`
 
-### File structure to create
-```
-dapr_agents/ext/__init__.py          # empty
-dapr_agents/ext/drasi/__init__.py    # exports: ChangeEvent, drasi_trigger, etc.
-dapr_agents/ext/drasi/models.py      # Pydantic v2 models (vendored from Drasi SDK)
-dapr_agents/ext/drasi/decorator.py   # @drasi_trigger
-dapr_agents/ext/drasi/config.py      # DrasiSubscriptionConfig dataclass
-
-tests/ext/__init__.py
-tests/ext/drasi/__init__.py
-tests/ext/drasi/test_models.py
-tests/ext/drasi/test_decorator.py
-```
-
----
-
-### Step 2.1 — `dapr_agents/ext/drasi/models.py`
-
-**DO NOT** import from `drasi-reaction-sdk` — it's alpha, not on PyPI.
-Vendor the models directly. All models must have `extra="ignore"` so unknown future
-Drasi fields don't cause ValidationError in production.
+**Simplification vs Drasi SDK:** Drasi uses `RootModel[Optional[Dict[str, Any]]]` for records. Use `Dict[str, Any]` directly — simpler for agent consumption.
 
 ```python
-from __future__ import annotations
-from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field
-
 class ResultEvent(BaseModel):
     model_config = ConfigDict(extra="ignore")
     kind: str
@@ -429,10 +226,18 @@ class UpdatePayload(BaseModel):
     after: Optional[Dict[str, Any]] = None
 
 class ChangeEvent(ResultEvent):
+    """Packed change event — all adds/updates/deletes in one message."""
     kind: Literal["change"] = "change"
     addedResults: List[Dict[str, Any]] = Field(default_factory=list)
     updatedResults: List[UpdatePayload] = Field(default_factory=list)
     deletedResults: List[Dict[str, Any]] = Field(default_factory=list)
+
+class ControlSignalKind(str, Enum):
+    BOOTSTRAP_STARTED = "bootstrapStarted"
+    BOOTSTRAP_COMPLETED = "bootstrapCompleted"
+    RUNNING = "running"
+    STOPPED = "stopped"
+    DELETED = "deleted"
 
 class ControlSignal(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -442,13 +247,7 @@ class ControlEvent(ResultEvent):
     kind: Literal["control"] = "control"
     controlSignal: ControlSignal
 
-class ControlSignalKind(str, Enum):
-    BOOTSTRAP_STARTED = "bootstrapStarted"
-    BOOTSTRAP_COMPLETED = "bootstrapCompleted"
-    RUNNING = "running"
-    STOPPED = "stopped"
-    DELETED = "deleted"
-
+# For unpacked delivery (individual change notifications)
 class ChangeOp(str, Enum):
     INSERT = "I"
     UPDATE = "U"
@@ -460,6 +259,7 @@ class ChangePayload(BaseModel):
     after: Optional[Dict[str, Any]] = None
 
 class DrasiChangeNotification(BaseModel):
+    """Single change record — used when router sends unpacked events."""
     model_config = ConfigDict(extra="ignore")
     op: ChangeOp
     queryId: str
@@ -468,46 +268,39 @@ class DrasiChangeNotification(BaseModel):
     payload: ChangePayload
 ```
 
-Source reference (to understand the schema):
-`drasi-platform/reactions/sdk/python/drasi/reaction/models/ChangeEvent.py`
+### Step 2: `@drasi_trigger` decorator (`dapr_agents/ext/drasi/decorator.py`)
 
----
-
-### Step 2.2 — `dapr_agents/ext/drasi/decorator.py`
-
-**Approach**: wrap the existing `@message_router` decorator (already in dapr-agents).
-This reuses all existing subscription, CloudEvent validation, and workflow scheduling logic.
-Just add `_is_drasi_trigger = True` as a flag for the fix in Step 2.3.
+**Approach:** Compose the existing `@message_router` decorator. This means:
+- The existing registration pipeline (`register_message_routes`, `_collect_message_bindings`, `_subscribe_message_bindings`) works unchanged
+- CloudEvent extraction, Pydantic validation, workflow scheduling all work as-is
+- `@drasi_trigger` is syntactic sugar that calls `@message_router` with the right topic + model
+- Set `_is_drasi_trigger = True` on the decorated function — required for Step 3
 
 ```python
-from typing import Callable, Literal, Optional
-from dapr_agents.workflow.decorators.decorators import message_router
-from .models import ChangeEvent, DrasiChangeNotification
-
 def drasi_trigger(
     func=None,
     *,
-    query_id: Optional[str] = None,
+    query_id: str | None = None,
     pubsub: str = "agent-pubsub",
-    topic: Optional[str] = None,
+    topic: str | None = None,
     format: Literal["packed", "unpacked"] = "packed",
-    dead_letter_topic: Optional[str] = None,
+    dead_letter_topic: str | None = None,
 ):
+    """
+    Subscribe an agent workflow to Drasi change events.
+    Either `query_id` or `topic` is required.
+    If only `query_id` given, topic defaults to f"drasi.{query_id}".
+    """
     resolved_topic = topic or (f"drasi.{query_id}" if query_id else None)
     if not resolved_topic:
-        raise ValueError(
-            "@drasi_trigger requires either 'topic' or 'query_id'. "
-            "Example: @drasi_trigger(query_id='sla-breaches')"
-        )
-    message_model = ChangeEvent if format == "packed" else DrasiChangeNotification
+        raise ValueError("Provide 'topic' or 'query_id'.")
+
+    model = ChangeEvent if format == "packed" else DrasiChangeNotification
 
     def decorator(f):
         decorated = message_router(
-            f,
-            pubsub=pubsub,
-            topic=resolved_topic,
-            message_model=message_model,
-            dead_letter_topic=dead_letter_topic,
+            f, pubsub=pubsub, topic=resolved_topic,
+            message_model=model, dead_letter_topic=dead_letter_topic,
         )
         setattr(decorated, "_is_drasi_trigger", True)
         return decorated
@@ -515,353 +308,190 @@ def drasi_trigger(
     return decorator if func is None else decorator(func)
 ```
 
----
+**Usage:**
+```python
+@drasi_trigger(query_id="sla-breaches", topic="support.sla-breach")
+def handle_breach(ctx, wf_input: dict):
+    ...
+```
 
-### Step 2.3 — Modify `dapr_agents/workflow/runners/agent.py`
+### Step 3: Fix topic override in `_build_pubsub_specs`
 
-**Why this fix is needed**: The existing `_build_pubsub_specs()` method always overwrites
-the decorator's topic with `config.agent_topic`. This means `@drasi_trigger(topic="support.sla-breach")`
-would be silently ignored and the agent would subscribe to the wrong topic.
+**Problem:** `_build_pubsub_specs` in `dapr_agents/workflow/runners/agent.py` always replaces the decorator's topic with `config.agent_topic`. This silently breaks `@drasi_trigger` — the agent subscribes to the wrong topic.
 
-**Find this method** (search for `_build_pubsub_specs` in `agent.py`).
-Inside the loop over handlers, add the `is_drasi` check:
+**Fix:** Check for `_is_drasi_trigger` flag and preserve the decorator's own topic/pubsub.
 
 ```python
-# BEFORE (original code — broken for drasi_trigger):
-for _, handler in handlers.items():
-    topic = config.agent_topic          # always overrides decorator's topic
-    pubsub_name = config.pubsub_name
-
-# AFTER (fixed):
+# In _build_pubsub_specs (dapr_agents/workflow/runners/agent.py, lines 273-305):
 for _, handler in handlers.items():
     meta = getattr(handler, "_message_router_data", {})
     is_drasi = getattr(handler, "_is_drasi_trigger", False)
     is_broadcast = meta.get("is_broadcast", False)
 
     if is_drasi:
-        topic = meta.get("topic")                      # preserve decorator's topic
+        # Drasi triggers define their own pubsub and topic — preserve them
+        topic = meta.get("topic")
         pubsub_name = meta.get("pubsub") or config.pubsub_name
-        if not topic:
-            raise ValueError(f"@drasi_trigger on '{handler.__name__}' missing topic")
     else:
         topic = config.broadcast_topic if is_broadcast else config.agent_topic
         pubsub_name = config.pubsub_name
-        if not topic:
-            raise ValueError(...)
+
+    if not topic:
+        raise ValueError(...)
+
+    specs.append(PubSubRouteSpec(
+        pubsub_name=pubsub_name, topic=topic,
+        handler_fn=handler, message_model=message_model,
+    ))
+```
+
+**File to modify:** `dapr_agents/workflow/runners/agent.py` (lines 273-305)
+
+### Step 4: Config dataclass (`dapr_agents/ext/drasi/config.py`)
+
+```python
+@dataclass
+class DrasiSubscriptionConfig:
+    default_pubsub: str = "agent-pubsub"
+    router_mcp_url: str | None = None  # e.g., "http://drasi-router:3001/mcp"
 ```
 
 ---
 
-### Step 2.4 — `dapr_agents/ext/drasi/__init__.py`
+## Deliverable 3: Demo — Proactive Support Agent (BUILD LAST)
 
-```python
-from .models import (
-    ChangeEvent, ControlEvent, DrasiChangeNotification,
-    ChangeOp, ChangePayload, UpdatePayload, ControlSignal, ControlSignalKind,
-)
-from .decorator import drasi_trigger
-from .config import DrasiSubscriptionConfig
+> Lives in **dapr-agents** repo at `examples/09-drasi-ambient-agent/`.
 
-__all__ = [
-    "ChangeEvent", "ControlEvent", "DrasiChangeNotification",
-    "ChangeOp", "ChangePayload", "UpdatePayload", "ControlSignal", "ControlSignalKind",
-    "drasi_trigger", "DrasiSubscriptionConfig",
-]
-```
+### Files
 
----
-
-### Step 2.5 — Tests
-
-Run with: `python -m pytest tests/ext/ -v`
-
-**`tests/ext/drasi/test_models.py`**: validate that real Drasi JSON parses correctly:
-```python
-def test_change_event_parses():
-    data = {
-        "kind": "change", "queryId": "sla-breaches", "sequence": 1,
-        "sourceTimeMs": 1700000000000,
-        "addedResults": [{"ticket_id": "T001"}],
-        "updatedResults": [], "deletedResults": []
-    }
-    event = ChangeEvent.model_validate(data)
-    assert event.queryId == "sla-breaches"
-    assert event.addedResults[0]["ticket_id"] == "T001"
-```
-
-**`tests/ext/drasi/test_decorator.py`**: verify decorator sets correct metadata:
-```python
-def test_sets_is_drasi_trigger():
-    @drasi_trigger(query_id="sla-breaches", topic="support.sla-breach")
-    def handle(ctx, wf_input): pass
-    assert getattr(handle, "_is_drasi_trigger") is True
-
-def test_sets_correct_topic():
-    @drasi_trigger(query_id="sla-breaches", topic="support.sla-breach")
-    def handle(ctx, wf_input): pass
-    meta = getattr(handle, "_message_router_data", {})
-    assert meta.get("topic") == "support.sla-breach"
-```
-
----
-
-## Deliverable 3: Demo — Proactive Support Agent
-
-**Repo:** `dapr-agents`
-**Location:** `examples/09-drasi-ambient-agent/`
-
-### What it does
-A "Proactive Support Agent" that:
-1. Sleeps at zero cost
-2. Wakes up when a Drasi event arrives on `support.sla-breach`
-3. Calls OpenAI LLM to draft an apology email for each overdue ticket
-4. Completes and goes back to sleep
-
-### Pattern to use: plain Dapr workflow (NOT DurableAgent)
-
-**Why NOT DurableAgent**: `DurableAgent` internally registers a `broadcast_listener` workflow
-that requires `broadcast_topic` in `AgentPubSubConfig`. It also needs an actor-enabled state store.
-That's 3x complexity for no benefit here. Use plain `wf.WorkflowRuntime()` instead.
-
-### File structure
 ```
 examples/09-drasi-ambient-agent/
-    agent.py
+    agent.py                    # The agent
     components/
-        agent-pubsub.yaml    # Dapr pub/sub using Redis
-        statestore.yaml      # Dapr state store using Redis
+        agent-pubsub.yaml       # Dapr pubsub component (Redis)
+        statestore.yaml         # Dapr state store (Redis, actorStateStore=true)
 ```
-
----
 
 ### `agent.py`
 
+> **Pattern:** Use plain `wf.WorkflowRuntime()` + `register_message_routes()`.
+> Do NOT use `DurableAgent` — it requires `broadcast_topic` + actor state store, which is unnecessary here.
+
+> **Critical:** Register BOTH the decorated entry-point function (`handle_sla_breach`) AND the
+> workflow function (`handle_sla_breach_workflow`) with the runtime. Dapr schedules workflows by
+> the decorated function's name — if only the workflow function is registered, you get
+> `OrchestratorNotRegisteredError` at runtime.
+
 ```python
-from __future__ import annotations
-import asyncio, logging, os, signal
-import dapr.ext.workflow as wf
-from dapr.clients import DaprClient
-from dotenv import load_dotenv
-from dapr_agents.ext.drasi import ChangeEvent, drasi_trigger
-from dapr_agents.llm.openai import OpenAIChatClient
-from dapr_agents.workflow.utils.registration import register_message_routes
-
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 llm = OpenAIChatClient(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 
-# WORKFLOW — orchestrates: one activity call per breach
 def handle_sla_breach_workflow(ctx: wf.DaprWorkflowContext, wf_input: dict):
+    """Workflow: one activity call per breach record in the event."""
     event = ChangeEvent.model_validate(wf_input)
-    results = []
     for breach in event.addedResults:
-        result = yield ctx.call_activity(draft_response_activity, input=breach)
-        results.append(result)
-        logger.info("Drafted response for ticket %s", breach.get("ticket_id"))
-    return results
+        yield ctx.call_activity(draft_response_activity, input=breach)
 
-# ACTIVITY — does the actual LLM call (runs in thread pool, blocking OK)
 def draft_response_activity(ctx, breach: dict) -> str:
-    prompt = (
-        f"Customer {breach.get('customer_id')} has ticket {breach.get('ticket_id')} "
-        f"that is {breach.get('sla_hours', 0)} hours past SLA. "
-        "Draft a brief (2-3 sentence) empathetic apology and one concrete next step."
-    )
-    response = llm.generate(messages=[{"role": "user", "content": prompt}])
-    text = str(response)
-    logger.info("LLM response for ticket %s: %s", breach.get("ticket_id"), text)
-    return text
+    """Activity: blocking LLM call — safe here, runs in thread pool."""
+    # build prompt from breach fields, call llm.generate(), return text
+    ...
 
-# ENTRY POINT — @drasi_trigger wires the pub/sub subscription
 @drasi_trigger(query_id="sla-breaches", topic="support.sla-breach")
 def handle_sla_breach(ctx: wf.DaprWorkflowContext, wf_input: dict):
+    """Entry point wired to pub/sub by @drasi_trigger."""
     return handle_sla_breach_workflow(ctx, wf_input)
-
-async def _wait_for_shutdown():
-    loop = asyncio.get_running_loop()
-    stop = asyncio.Event()
-    try:
-        loop.add_signal_handler(signal.SIGINT, stop.set)
-        loop.add_signal_handler(signal.SIGTERM, stop.set)
-    except NotImplementedError:
-        signal.signal(signal.SIGINT, lambda *_: stop.set())
-    await stop.wait()
 
 async def main():
     runtime = wf.WorkflowRuntime()
-    # CRITICAL: register BOTH names — Dapr schedules by decorated function name
-    # (handle_sla_breach) but actual logic is in handle_sla_breach_workflow.
-    # Miss either one → OrchestratorNotRegisteredError at runtime.
     runtime.register_workflow(handle_sla_breach_workflow)
-    runtime.register_workflow(handle_sla_breach)
+    runtime.register_workflow(handle_sla_breach)   # both names required — see note above
     runtime.register_activity(draft_response_activity)
     runtime.start()
 
-    logger.info("Agent is ready. Waiting for Drasi events on 'support.sla-breach'.")
+    with DaprClient() as client:
+        closers = register_message_routes(targets=[handle_sla_breach], dapr_client=client)
+        await _wait_for_shutdown()
+        for close in closers:
+            close()
 
-    try:
-        with DaprClient() as client:
-            closers = register_message_routes(targets=[handle_sla_breach], dapr_client=client)
-            try:
-                await _wait_for_shutdown()
-            finally:
-                for close in closers:
-                    try: close()
-                    except Exception: logger.exception("Error closing subscription")
-    finally:
-        runtime.shutdown()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    runtime.shutdown()
 ```
 
----
+### End-to-end flow
 
-### `components/agent-pubsub.yaml`
+1. Drasi CQ `sla-breaches` monitors database for `tickets WHERE status='open' AND sla_hours > 24`
+2. New match → Drasi publishes `ChangeEvent` to `sla-breaches-results` on `drasi-pubsub`
+3. Router receives it, wraps as CloudEvent, publishes to `support.sla-breach` on `agent-pubsub`
+4. Agent wakes up (scale from zero), `handle_sla_breach` fires, LLM drafts response per ticket
+5. Workflow completes, agent goes back to sleep
 
-```yaml
-apiVersion: dapr.io/v1alpha1
-kind: Component
-metadata:
-  name: agent-pubsub
-spec:
-  type: pubsub.redis
-  version: v1
-  metadata:
-    - name: redisHost
-      value: localhost:6379
-    - name: redisPassword
-      value: ""
-```
-
-### `components/statestore.yaml`
-
-```yaml
-apiVersion: dapr.io/v1alpha1
-kind: Component
-metadata:
-  name: statestore
-spec:
-  type: state.redis
-  version: v1
-  metadata:
-    - name: redisHost
-      value: localhost:6379
-    - name: redisPassword
-      value: ""
-    - name: actorStateStore
-      value: "true"
-```
-
----
-
-## How to Run Locally (Mac — step by step)
-
-### One-time setup
+### To test locally (no real Drasi needed)
 
 ```bash
-# 1. Start Dapr (creates placement, scheduler, zipkin, redis containers)
-dapr init
-
-# 2. Check all 4 containers are running
-docker ps --format "table {{.Names}}\t{{.Status}}"
-# Must see: dapr_redis, dapr_placement, dapr_scheduler, dapr_zipkin
-
-# 3. Expose Redis port to localhost
-#    (dapr init's redis has no host port by default — fix this)
-docker stop dapr_redis && docker rm dapr_redis
-docker run -d --name dapr_redis -p 6379:6379 redis:6
-
-# 4. Install dapr-agents
-cd /path/to/dapr-agents
-pip install -e ".[all]"
-```
-
-### Run the demo
-
-```bash
-# Terminal 1 — start the agent
-cd examples/09-drasi-ambient-agent
+# Terminal 1 — start agent (no --app-port flag; streaming subscriptions don't need it)
 export OPENAI_API_KEY=sk-...
 dapr run --app-id proactive-support --resources-path ./components -- python agent.py
-# DO NOT add --app-port (streaming subscriptions don't need it)
 
-# Wait for this line:
-# INFO  Subscribing to pubsub 'agent-pubsub' topic 'support.sla-breach'
-
-# Terminal 2 — send a simulated Drasi event (same JSON structure as real Drasi)
+# Terminal 2 — simulate a Drasi event (same JSON structure as real Drasi)
 dapr publish --publish-app-id proactive-support \
-  --pubsub agent-pubsub --topic support.sla-breach \
-  --data '{"kind":"change","queryId":"sla-breaches","sequence":1,"sourceTimeMs":1700000000000,"addedResults":[{"ticket_id":"T001","customer_id":"C123","sla_hours":26}],"updatedResults":[],"deletedResults":[]}'
+    --pubsub agent-pubsub --topic support.sla-breach \
+    --data '{
+      "kind":"change","queryId":"sla-breaches","sequence":1,
+      "sourceTimeMs":1700000000000,
+      "addedResults":[{"ticket_id":"T001","customer_id":"C123","sla_hours":26}],
+      "updatedResults":[],"deletedResults":[]
+    }'
 ```
 
-### What success looks like in Terminal 1
-
-```
-INFO  Workflow started for SLA breach event
-INFO  Processing: queryId=sla-breaches, sequence=1, breaches=1
-INFO  LLM response for ticket T001: Dear Customer C123, I sincerely apologize...
-INFO  Drafted response for ticket T001
-INFO  Orchestration completed with status: COMPLETED
-```
-
-The apology text is **generated live by OpenAI** — different every run.
-That's proof it's real, not hardcoded.
+Watch Terminal 1 — the agent wakes up, calls the LLM, logs the generated response.
 
 ---
 
-## Bugs You Will Hit (and exact fixes)
+## Failure Scenarios
 
-These all happened during the original build. Read this before you start.
+| Scenario | Handling |
+|----------|----------|
+| Router crashes mid-publish | Drasi redelivers (at-least-once via Dapr pub/sub). Router is stateless per event. |
+| Agent workflow fails | Dapr workflow retry policy (exponential backoff). Dead letter topic collects poison messages. |
+| Duplicate events | Agent-side: `DedupeBackend` in `registration.py` deduplicates by CloudEvent ID. Events include `sequence` for ordering. |
+| Router can't reach agent pubsub | Dapr pub/sub component retries internally. Router returns non-success to Drasi topic, triggering redelivery. |
+| Out-of-order events | `sequence` field is monotonically increasing per query. Rely on at-least-once + idempotent workflows. Future: track last sequence in state store. |
 
-| # | Bug | When you hit it | Fix |
-|---|-----|----------------|-----|
-| 1 | `AgentPubSubConfig missing topic for broadcast handler` | If you use `DurableAgent` | Don't use DurableAgent. Use plain `wf.WorkflowRuntime()` + `register_message_routes()` |
-| 2 | `OrchestratorNotRegisteredError: 'handle_sla_breach' not registered` | When event arrives | Register BOTH `handle_sla_breach` AND `handle_sla_breach_workflow` with runtime |
-| 3 | `DaprClient has no __aenter__` | Router starts, event arrives | Use `with DaprClient()` not `async with DaprClient()` — it's synchronous |
-| 4 | `ValidationError: extra fields not permitted` | Real Drasi sends unknown fields | Add `model_config = ConfigDict(extra="ignore")` to all Pydantic models |
-| 5 | `dial tcp 127.0.0.1:6379: connection refused` | Agent starts | Redis not running. Run `docker run -d --name dapr_redis -p 6379:6379 redis:6` |
-| 6 | Agent waiting for port 8009, never starts | Using `--app-port` flag | Remove `--app-port` — streaming subscriptions don't need an HTTP server |
-| 7 | `@drasi_trigger` topic silently ignored, wrong topic subscribed | After agent starts | Apply the `_is_drasi_trigger` fix in `agent.py:_build_pubsub_specs` |
+## Security Considerations
 
----
+| Concern | Mitigation |
+|---------|------------|
+| Pub/sub auth | Configure Dapr pub/sub components with auth (Redis passwords, Kafka SASL). Not application code. |
+| MCP server exposure | ClusterIP only (not exposed outside cluster). Add API key header if external access needed. |
+| Sensitive data in events | Add optional `field_filter` in `RouterQueryConfig` to mask/drop sensitive fields before forwarding. |
+| Topic authorization | Use Dapr pub/sub topic scoping so agents can only subscribe to their designated topics, not `drasi-pubsub`. |
+| Secrets | Use Dapr secret store references in reaction config, not plaintext env vars. |
 
-## Running All Tests
+## Verification / Testing
 
-```bash
-# SDK extension (12 tests) — from dapr-agents root
-python -m pytest tests/ext/ -v
+1. **Unit tests:** Validate Pydantic models parse real Drasi JSON payloads. Test `@drasi_trigger` sets correct `_message_router_data` attributes. Test formatter outputs correct packed/unpacked formats.
+2. **Integration test:** Start agent locally with `dapr run`. Publish a mock `ChangeEvent` via `dapr publish`. Verify agent workflow triggers and LLM is called with real data.
+3. **End-to-end:** Use Drasi CLI to create a source + query against a test Postgres DB. Insert a row. Verify the agent receives the change and produces output.
 
-# Router Reaction (9 tests) — from drasi-platform root
-cd reactions/dapr-agents-router
-pip install -e "../../sdk/python"  # install Drasi Python SDK
-pip install pytest-asyncio
-python -m pytest tests/ -v
-```
+## Key Files to Modify/Create
 
----
+**Modify:**
+- `dapr_agents/workflow/runners/agent.py` (lines 273-305) — add `_is_drasi_trigger` check in `_build_pubsub_specs`
 
-## What's Needed for Full Production (not built yet)
+**Create (SDK extension):**
+- `dapr_agents/ext/__init__.py`
+- `dapr_agents/ext/drasi/__init__.py`
+- `dapr_agents/ext/drasi/models.py`
+- `dapr_agents/ext/drasi/decorator.py`
+- `dapr_agents/ext/drasi/config.py`
 
-1. **Kubernetes deployment for Router Reaction**
-   - `Deployment` manifest for the router container
-   - `ConfigMap` with per-query YAML configs (mounts to `/etc/queries/`)
-   - Drasi `Reaction` CRD YAML pointing to router image
+**Create (Router Reaction):**
+- `reactions/dapr-agents-router/src/main.py`
+- `reactions/dapr-agents-router/src/router.py`
+- `reactions/dapr-agents-router/src/formatter.py`
+- `reactions/dapr-agents-router/src/config.py`
+- `reactions/dapr-agents-router/src/mcp_server.py`
 
-2. **Real Drasi setup** (needs Kubernetes)
-   - `kind` or Docker Desktop Kubernetes enabled
-   - `drasi init` to install Drasi on cluster
-   - A Postgres database with a `tickets` table
-   - Drasi `Source` CRD pointing to Postgres
-   - Drasi `ContinuousQuery` CRD: `SELECT * FROM tickets WHERE sla_hours > 24`
-
-3. **Real end-to-end test**
-   - Insert a row into Postgres with `sla_hours = 26`
-   - Watch Drasi fire → Router forwards → Agent wakes up → LLM responds
-
-Everything else is complete.
+**Create (Demo):**
+- `examples/09-drasi-ambient-agent/agent.py`
+- `examples/09-drasi-ambient-agent/components/*.yaml`
