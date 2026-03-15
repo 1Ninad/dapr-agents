@@ -1,134 +1,167 @@
 """
 Proactive Support Agent - Example 09: Drasi Ambient Agent
 
-This agent wakes up ONLY when Drasi detects an SLA breach in the database.
-It processes the breach and drafts a customer response.
+This agent wakes up ONLY when a Drasi change event arrives on its pub/sub topic.
+It processes each SLA breach and drafts a customer response using an LLM.
+
+Architecture:
+    Drasi change event
+        --> Router Reaction publishes to [agent-pubsub: support.sla-breach]
+        --> @drasi_trigger fires, starts a Dapr workflow
+        --> Workflow calls LLM to draft a response
+        --> Agent goes back to sleep (scale-to-zero)
 
 To test locally (no real Drasi needed):
-    # Terminal 1: Start the agent
-    dapr run --app-id proactive-support --app-port 8009 \\
-        --resources-path ./components -- python agent.py
 
-    # Terminal 2: Simulate a Drasi event
-    dapr publish --publish-app-id proactive-support \\
-        --pubsub agent-pubsub --topic support.sla-breach \\
-        --data '{"kind":"change","queryId":"sla-breaches","sequence":1,
-                 "sourceTimeMs":1700000000000,
-                 "addedResults":[{"ticket_id":"T001","customer_id":"C123","sla_hours":26}],
-                 "updatedResults":[],"deletedResults":[]}'
+    Terminal 1 - Start the agent:
+        dapr run --app-id proactive-support --app-port 8009 \\
+            --resources-path ./components -- python agent.py
 
-See README.md for full setup instructions.
+    Terminal 2 - Simulate a Drasi event:
+        dapr publish --publish-app-id proactive-support \\
+            --pubsub agent-pubsub --topic support.sla-breach \\
+            --data '{
+              "kind":"change","queryId":"sla-breaches","sequence":1,
+              "sourceTimeMs":1700000000000,
+              "addedResults":[{"ticket_id":"T001","customer_id":"C123","sla_hours":26}],
+              "updatedResults":[],"deletedResults":[]
+            }'
+
+    Watch Terminal 1 - the agent wakes up, calls the LLM, logs the response.
 """
+from __future__ import annotations
+
+import asyncio
 import logging
 import os
+import signal
 
-from dapr_agents import DurableAgent, OpenAIChatClient
-from dapr_agents.agents.configs import AgentPubSubConfig, AgentStateConfig
+import dapr.ext.workflow as wf
+from dapr.clients import DaprClient
+from dotenv import load_dotenv
+
 from dapr_agents.ext.drasi import ChangeEvent, drasi_trigger
-from dapr_agents.storage.daprstores.stateservice import StateStoreService
-from dapr_agents.workflow.decorators import workflow_entry
-from dapr_agents.workflow.runners.agent import AgentRunner
+from dapr_agents.llm.openai import OpenAIChatClient
+from dapr_agents.workflow.utils.registration import register_message_routes
 
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── LLM setup ──────────────────────────────────────────────────────────────────
-llm = OpenAIChatClient(
-    model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-)
+llm = OpenAIChatClient(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 
-# ── Agent definition ────────────────────────────────────────────────────────────
-agent = DurableAgent(
-    name="proactive-support",
-    role="Proactive Customer Support Agent",
-    goal=(
-        "When notified of an SLA breach, acknowledge it, draft a brief personalized "
-        "apology, and suggest next steps. Be empathetic and concise."
-    ),
-    instructions=[
-        "Always address the customer by their customer ID until you have their real name.",
-        "Keep responses under 3 sentences.",
-        "Escalate if breach is more than 48 hours.",
-    ],
-    llm=llm,
-    pubsub=AgentPubSubConfig(
-        pubsub_name="agent-pubsub",
-        agent_topic="support.agent",          # Agent's own direct-message topic
-    ),
-    state=AgentStateConfig(store=StateStoreService(store_name="statestore")),
-)
+
+# ── Workflow definition ─────────────────────────────────────────────────────────
+def handle_sla_breach_workflow(ctx: wf.DaprWorkflowContext, wf_input: dict):
+    """
+    Dapr workflow: runs when a Drasi SLA-breach event is received.
+    wf_input is the ChangeEvent payload as a dict.
+    """
+    logger.info("Workflow started for SLA breach event")
+
+    event = ChangeEvent.model_validate(wf_input)
+    logger.info(
+        "Processing: queryId=%s, sequence=%d, breaches=%d",
+        event.queryId, event.sequence, len(event.addedResults),
+    )
+
+    results = []
+    for breach in event.addedResults:
+        result = yield ctx.call_activity(draft_response_activity, input=breach)
+        results.append(result)
+        logger.info("Drafted response for ticket %s", breach.get("ticket_id"))
+
+    return results
+
+
+def draft_response_activity(ctx, breach: dict) -> str:
+    """
+    Dapr activity: calls the LLM to draft one response per SLA breach record.
+    Activities run in a thread pool - safe for blocking LLM calls.
+    """
+    ticket_id = breach.get("ticket_id", "unknown")
+    customer_id = breach.get("customer_id", "unknown")
+    sla_hours = breach.get("sla_hours", 0)
+
+    prompt = (
+        f"Customer {customer_id} has ticket {ticket_id} that is {sla_hours} hours past SLA. "
+        "Draft a brief (2-3 sentence), empathetic apology and suggest one concrete next step."
+    )
+
+    messages = [{"role": "user", "content": prompt}]
+    response = llm.generate(messages=messages)
+    text = str(response)
+    logger.info("LLM response for ticket %s: %s", ticket_id, text)
+    return text
 
 
 # ── Drasi trigger ───────────────────────────────────────────────────────────────
+# @drasi_trigger subscribes this workflow to the 'support.sla-breach' topic.
+# When an event arrives, register_message_routes() starts a new workflow instance.
+
 @drasi_trigger(query_id="sla-breaches", topic="support.sla-breach")
-@workflow_entry
-def handle_sla_breach(self, ctx, wf_input: dict) -> str:
+def handle_sla_breach(ctx: wf.DaprWorkflowContext, wf_input: dict):
     """
-    This function runs every time Drasi detects a new SLA breach.
+    Entry point registered with @drasi_trigger.
 
-    The @drasi_trigger decorator:
-    - Subscribes to the 'support.sla-breach' topic on 'agent-pubsub'
-    - Validates the incoming message as a ChangeEvent
-    - Wakes up this workflow when a message arrives
-
-    The @workflow_entry decorator marks this as the Dapr workflow entrypoint.
+    The decorator wires the pub/sub subscription. When a message arrives on
+    'support.sla-breach', the pipeline validates it as a ChangeEvent and
+    starts handle_sla_breach_workflow as a new Dapr workflow instance.
     """
-    logger.info("Received SLA breach event, processing...")
+    return handle_sla_breach_workflow(ctx, wf_input)
 
-    # Parse the ChangeEvent from the workflow input
+
+# ── Shutdown helper ─────────────────────────────────────────────────────────────
+async def _wait_for_shutdown() -> None:
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+
+    def _set_stop(*_):
+        stop.set()
+
     try:
-        event = ChangeEvent.model_validate(wf_input)
-    except Exception as e:
-        logger.error("Failed to parse SLA breach event: %s", e)
-        return f"Error parsing event: {e}"
+        loop.add_signal_handler(signal.SIGINT, _set_stop)
+        loop.add_signal_handler(signal.SIGTERM, _set_stop)
+    except NotImplementedError:
+        signal.signal(signal.SIGINT, lambda *_: _set_stop())
 
-    results = []
-
-    for breach in event.addedResults:
-        ticket_id = breach.get("ticket_id", "unknown")
-        customer_id = breach.get("customer_id", "unknown")
-        sla_hours = breach.get("sla_hours", 0)
-
-        logger.info(
-            "Processing breach: ticket=%s, customer=%s, hours_overdue=%s",
-            ticket_id, customer_id, sla_hours,
-        )
-
-        # Use the agent's LLM to draft a response
-        prompt = (
-            f"Customer {customer_id} has ticket {ticket_id} that is {sla_hours} hours past SLA. "
-            "Draft a brief, empathetic apology message and suggest one concrete next step."
-        )
-
-        # Run the agent's LLM synchronously within the workflow activity
-        response = yield ctx.call_activity(
-            _draft_response,
-            input={"prompt": prompt, "ticket_id": ticket_id},
-        )
-
-        logger.info("Response drafted for ticket %s: %s", ticket_id, response)
-        results.append({"ticket_id": ticket_id, "response": response})
-
-    return str(results)
+    await stop.wait()
 
 
-def _draft_response(ctx, input_data: dict) -> str:
-    """
-    A Dapr workflow activity that calls the LLM to draft a response.
-    Activities run in a thread pool and can do blocking I/O.
-    """
-    prompt = input_data.get("prompt", "")
-    # Simple synchronous LLM call
-    messages = [{"role": "user", "content": prompt}]
-    response = llm.generate(messages=messages)
-    return str(response)
+# ── Main ────────────────────────────────────────────────────────────────────────
+async def main() -> None:
+    # Register the workflow and activity with Dapr's workflow runtime
+    runtime = wf.WorkflowRuntime()
+    runtime.register_workflow(handle_sla_breach_workflow)
+    runtime.register_activity(draft_response_activity)
+    runtime.start()
 
-
-# ── Start the agent ─────────────────────────────────────────────────────────────
-if __name__ == "__main__":
     logger.info("Starting Proactive Support Agent...")
     logger.info("Listening for SLA breaches on topic 'support.sla-breach'")
     logger.info("Agent is ready. It will wake up only when Drasi sends an event.")
 
-    runner = AgentRunner()
-    runner.serve(agent)
+    try:
+        with DaprClient() as client:
+            # Wire @drasi_trigger subscription - one call activates the agent
+            closers = register_message_routes(
+                targets=[handle_sla_breach],
+                dapr_client=client,
+            )
+            try:
+                await _wait_for_shutdown()
+            finally:
+                for close in closers:
+                    try:
+                        close()
+                    except Exception:
+                        logger.exception("Error closing subscription")
+    finally:
+        runtime.shutdown()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
