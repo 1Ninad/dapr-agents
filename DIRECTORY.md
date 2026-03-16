@@ -63,8 +63,6 @@ drasi-platform/
         │   └── mcp_server.py                 – MCP server for query discovery
         │
         └── tests/
-<!-- @import "[TOC]" {cmd="toc" depthFrom=1 depthTo=6 orderedList=false} -->
-
             ├── __init__.py
             ├── test_router.py                – unit tests for router logic
             └── test_formatter.py             – unit tests for packed/unpacked formatting
