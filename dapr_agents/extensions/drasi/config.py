@@ -16,7 +16,7 @@ class DrasiSubscriptionConfig:
     MCP server at startup to dynamically discover available queries.
 
     Example:
-        from dapr_agents.ext.drasi import DrasiSubscriptionConfig
+        from dapr_agents.extensions.drasi import DrasiSubscriptionConfig
         from dapr_agents.tool.mcp.client import MCPClient
 
         drasi_config = DrasiSubscriptionConfig(

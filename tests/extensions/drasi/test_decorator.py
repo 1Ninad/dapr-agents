@@ -3,8 +3,8 @@ Tests for @drasi_trigger decorator.
 Verifies it sets the right metadata attributes for the registration pipeline.
 """
 import pytest
-from dapr_agents.ext.drasi.decorator import drasi_trigger
-from dapr_agents.ext.drasi.models import ChangeEvent, DrasiChangeNotification
+from dapr_agents.extensions.drasi.decorator import drasi_trigger
+from dapr_agents.extensions.drasi.models import ChangeEvent, DrasiChangeNotification
 
 
 def test_drasi_trigger_sets_message_router_data():

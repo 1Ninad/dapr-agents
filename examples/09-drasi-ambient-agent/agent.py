@@ -40,7 +40,7 @@ import dapr.ext.workflow as wf
 from dapr.clients import DaprClient
 from dotenv import load_dotenv
 
-from dapr_agents.ext.drasi import ChangeEvent, drasi_trigger
+from dapr_agents.extensions.drasi import ChangeEvent, drasi_trigger
 from dapr_agents.llm.openai import OpenAIChatClient
 from dapr_agents.workflow.utils.registration import register_message_routes
 

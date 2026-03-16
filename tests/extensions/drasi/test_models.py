@@ -3,7 +3,7 @@ Tests for Drasi event Pydantic models.
 No external services needed.
 """
 import pytest
-from dapr_agents.ext.drasi.models import (
+from dapr_agents.extensions.drasi.models import (
     ChangeEvent,
     ChangeOp,
     ControlEvent,

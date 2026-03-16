@@ -1,10 +1,10 @@
 """
-dapr_agents.ext.drasi - Drasi integration for Dapr Agents.
+dapr_agents.extensions.drasi - Drasi integration for Dapr Agents.
 
 Lets Dapr Agents subscribe to Drasi change events using a single decorator.
 
 Usage:
-    from dapr_agents.ext.drasi import drasi_trigger, ChangeEvent
+    from dapr_agents.extensions.drasi import drasi_trigger, ChangeEvent
 
     @drasi_trigger(query_id="sla-breaches")
     async def handle_breach(self, ctx, message: ChangeEvent):
@@ -12,9 +12,9 @@ Usage:
             customer_id = breach.get("customer_id")
             # The agent wakes up here and processes the breach
 """
-from dapr_agents.ext.drasi.config import DrasiSubscriptionConfig
-from dapr_agents.ext.drasi.decorator import drasi_trigger
-from dapr_agents.ext.drasi.models import (
+from dapr_agents.extensions.drasi.config import DrasiSubscriptionConfig
+from dapr_agents.extensions.drasi.decorator import drasi_trigger
+from dapr_agents.extensions.drasi.models import (
     ChangeEvent,
     ChangeOp,
     ChangePayload,

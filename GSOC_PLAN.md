@@ -11,7 +11,7 @@ Database --> Drasi CQ Engine --> [drasi-pubsub: {queryId}-results] --> Router Re
 
 Three deliverables (build order):
 1. **Router Reaction** (standalone Python microservice in **drasi-platform** repo) - bridges Drasi events to agent pub/sub topics + hosts MCP server. **Build first** - produces the CloudEvent contract.
-2. **SDK Extension** (`dapr_agents.ext.drasi` in **dapr-agents** repo) - Pydantic models + `@drasi_trigger` decorator. **Build second** - consumes the contract defined by the router.
+2. **SDK Extension** (`dapr_agents.extensions.drasi` in **dapr-agents** repo) - Pydantic models + `@drasi_trigger` decorator. **Build second** - consumes the contract defined by the router.
 3. **Demo** - end-to-end "Proactive Support Agent" in **dapr-agents** repo. **Build last** - wires everything together.
 
 ---
@@ -191,17 +191,17 @@ spec:
 
 | File | Purpose |
 |------|---------|
-| `dapr_agents/ext/__init__.py` | Empty. Establishes `ext` namespace for future extensions. |
-| `dapr_agents/ext/drasi/__init__.py` | Public API: exports models, decorator, config. |
-| `dapr_agents/ext/drasi/models.py` | Pydantic v2 models for Drasi events (vendored, not imported from drasi-reaction-sdk). |
-| `dapr_agents/ext/drasi/decorator.py` | `@drasi_trigger` decorator. |
-| `dapr_agents/ext/drasi/config.py` | `DrasiSubscriptionConfig` dataclass. |
-| `tests/ext/__init__.py` | Empty. |
-| `tests/ext/drasi/__init__.py` | Empty. |
-| `tests/ext/drasi/test_models.py` | Tests for model validation. |
-| `tests/ext/drasi/test_decorator.py` | Tests for decorator behavior. |
+| `dapr_agents/extensions/__init__.py` | Empty. Establishes `ext` namespace for future extensions. |
+| `dapr_agents/extensions/drasi/__init__.py` | Public API: exports models, decorator, config. |
+| `dapr_agents/extensions/drasi/models.py` | Pydantic v2 models for Drasi events (vendored, not imported from drasi-reaction-sdk). |
+| `dapr_agents/extensions/drasi/decorator.py` | `@drasi_trigger` decorator. |
+| `dapr_agents/extensions/drasi/config.py` | `DrasiSubscriptionConfig` dataclass. |
+| `tests/extensions/__init__.py` | Empty. |
+| `tests/extensions/drasi/__init__.py` | Empty. |
+| `tests/extensions/drasi/test_models.py` | Tests for model validation. |
+| `tests/extensions/drasi/test_decorator.py` | Tests for decorator behavior. |
 
-### Step 1: Pydantic models (`dapr_agents/ext/drasi/models.py`)
+### Step 1: Pydantic models (`dapr_agents/extensions/drasi/models.py`)
 
 Vendor the Drasi event models (~60 lines). Do NOT add `drasi-reaction-sdk` as a dependency — it's alpha and not on PyPI.
 
@@ -268,7 +268,7 @@ class DrasiChangeNotification(BaseModel):
     payload: ChangePayload
 ```
 
-### Step 2: `@drasi_trigger` decorator (`dapr_agents/ext/drasi/decorator.py`)
+### Step 2: `@drasi_trigger` decorator (`dapr_agents/extensions/drasi/decorator.py`)
 
 **Approach:** Compose the existing `@message_router` decorator. This means:
 - The existing registration pipeline (`register_message_routes`, `_collect_message_bindings`, `_subscribe_message_bindings`) works unchanged
@@ -347,7 +347,7 @@ for _, handler in handlers.items():
 
 **File to modify:** `dapr_agents/workflow/runners/agent.py` (lines 273-305)
 
-### Step 4: Config dataclass (`dapr_agents/ext/drasi/config.py`)
+### Step 4: Config dataclass (`dapr_agents/extensions/drasi/config.py`)
 
 ```python
 @dataclass
@@ -479,11 +479,11 @@ Watch Terminal 1 — the agent wakes up, calls the LLM, logs the generated respo
 - `dapr_agents/workflow/runners/agent.py` (lines 273-305) — add `_is_drasi_trigger` check in `_build_pubsub_specs`
 
 **Create (SDK extension):**
-- `dapr_agents/ext/__init__.py`
-- `dapr_agents/ext/drasi/__init__.py`
-- `dapr_agents/ext/drasi/models.py`
-- `dapr_agents/ext/drasi/decorator.py`
-- `dapr_agents/ext/drasi/config.py`
+- `dapr_agents/extensions/__init__.py`
+- `dapr_agents/extensions/drasi/__init__.py`
+- `dapr_agents/extensions/drasi/models.py`
+- `dapr_agents/extensions/drasi/decorator.py`
+- `dapr_agents/extensions/drasi/config.py`
 
 **Create (Router Reaction):**
 - `reactions/dapr-agents-router/src/main.py`
