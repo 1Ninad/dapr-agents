@@ -10,7 +10,7 @@ dapr-agents/
 │
 ├── dapr_agents/
 │   │
-│   ├── ext/                                 – extensions namespace
+│   ├── extensions/                                 – extensions namespace
 │   │   ├── __init__.py
 │   │   └── drasi/                           – Drasi SDK extension module
 │   │       ├── __init__.py                  – public API exports
@@ -32,7 +32,7 @@ dapr-agents/
 │           └── statestore.yaml              – Dapr state store (Redis)
 │
 └── tests/
-    └── ext/                                 – tests for the extension
+    └── extensions/                                 – tests for the extension
         ├── __init__.py
         └── drasi/
             ├── __init__.py
