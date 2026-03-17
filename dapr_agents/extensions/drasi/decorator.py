@@ -49,57 +49,19 @@ def drasi_trigger(
     format: Literal["packed", "unpacked"] = "packed",
     dead_letter_topic: Optional[str] = None,
 ) -> Callable:
-    """
-    Subscribe an agent method to Drasi change events via Dapr Pub/Sub.
-
-    The Drasi Agent Router must be configured to publish to the matching topic.
-    This decorator wires everything up automatically - no manual subscription code needed.
-
-    Args:
-        query_id:   The Drasi query ID (e.g., "sla-breaches"). Topic defaults to
-                    "drasi.{query_id}" if not set explicitly.
-        pubsub:     Dapr pub/sub component name (must match what your router publishes to).
-                    Default: "agent-pubsub".
-        topic:      Explicit topic name. Overrides the query_id-derived default.
-        format:     "packed" = one ChangeEvent per query update (default).
-                    "unpacked" = one DrasiChangeNotification per changed record.
-        dead_letter_topic: Topic for failed/unprocessable messages (optional DLQ).
-
-    Raises:
-        ValueError: If neither query_id nor topic is provided.
-    """
-    # Derive the topic from query_id if not explicitly given
     resolved_topic = topic or (f"drasi.{query_id}" if query_id else None)
     if not resolved_topic:
-        raise ValueError(
-            "@drasi_trigger requires either 'topic' or 'query_id'. "
-            "Example: @drasi_trigger(query_id='sla-breaches')"
-        )
-
-    # Pick the right Pydantic model based on the delivery format
+        raise ValueError("@drasi_trigger requires either 'topic' or 'query_id'. "
+            "Example: @drasi_trigger(query_id='sla-breaches')")
     message_model = ChangeEvent if format == "packed" else DrasiChangeNotification
 
     def decorator(f: Callable[..., Any]) -> Callable[..., Any]:
         # Delegate to @message_router for all the subscription wiring
-        decorated = message_router(
-            f,
-            pubsub=pubsub,
-            topic=resolved_topic,
-            message_model=message_model,
-            dead_letter_topic=dead_letter_topic,
-        )
-        # Mark this as a Drasi trigger so AgentRunner._build_pubsub_specs
-        # knows not to override our topic with the agent's default agent_topic
-        setattr(decorated, "_is_drasi_trigger", True)
+        decorated = message_router(f, pubsub=pubsub, topic=resolved_topic, message_model=message_model, dead_letter_topic=dead_letter_topic,)
+        setattr(decorated, "_is_drasi_trigger", True)       # flag tells the agent runner to preserve this topic, not override it
         return decorated
-
-    # Support @drasi_trigger(...) syntax only.
-    # @drasi_trigger without parentheses passes func as the first positional arg,
-    # which means query_id and topic are both None — raise TypeError to signal
-    # incorrect usage (keyword arguments are required).
     if func is not None:
-        raise TypeError(
-            "@drasi_trigger requires keyword arguments. "
-            "Use @drasi_trigger(query_id='...') not @drasi_trigger."
-        )
+        raise TypeError("@drasi_trigger requires keyword arguments. Use @drasi_trigger(query_id='...') not @drasi_trigger.")
+    
+    
     return decorator
