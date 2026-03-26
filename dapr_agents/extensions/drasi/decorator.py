@@ -2,7 +2,6 @@
 The @drasi_trigger decorator.
 
 This is the main user-facing API for connecting Dapr Agents to Drasi change events.
-It is syntactic sugar over @message_router with Drasi-specific defaults.
 
 How it works:
 1. @drasi_trigger calls @message_router internally with:
